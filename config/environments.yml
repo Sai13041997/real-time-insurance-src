@@ -1,0 +1,7 @@
+environments:
+  dev:
+    aws_region: "us-east-1"
+    apigw:
+      enabled: true
+      rest_api_id: "6h5fz78wz0"
+      stage_name: "default"
