@@ -1,0 +1,11 @@
+lambdas:
+  example_hello:
+    folder: "example_hello"
+    handler: "example_hello.handler.lambda_handler"
+    function_name:
+      dev: "realtimeinsurance-dev-hello-lambda"
+  sample_2:
+    folder: "sample_2"
+    handler: "index.handler.lambda_handler"
+    function_name:
+      dev: "realtimeinsurance-dev-sample-lambda"
