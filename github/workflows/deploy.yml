@@ -2,7 +2,6 @@ name: Deploy
 
 on:
   push:
-    branches: [ "main" ]
   workflow_dispatch:
     inputs:
       environment:
@@ -16,6 +15,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  deployments: read
 
 jobs:
   detect-changes:
@@ -46,12 +46,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE="${{ github.event.before }}"
-          if [[ -z "${BASE}" || "${BASE}" == "0000000000000000000000000000000000000000" ]]; then
-            BASE="origin/main~1"
-          fi
+          REPO="${{ github.repository }}"
+          TARGET_ENV="${{ steps.env.outputs.env }}"
 
-          CHANGED_LINES="$(python3 scripts/changed_lambdas.py --base-ref "${BASE}" || true)"
+          # Derive BASE from deployment state for the target environment.
+          BASE=""
+          DEPLOYMENTS_JSON="$(curl -fsSL \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/deployments?environment=${TARGET_ENV}&per_page=50")"
+
+          while IFS='|' read -r dep_id dep_sha; do
+            [[ -z "${dep_id}" || -z "${dep_sha}" ]] && continue
+
+            state="$(curl -fsSL \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/deployments/${dep_id}/statuses?per_page=1" \
+              | jq -r '.[0].state // empty')"
+
+            if [[ "${state}" == "success" ]]; then
+              BASE="${dep_sha}"
+              break
+            fi
+          done < <(jq -r '.[] | "\(.id)|\(.sha)"' <<< "${DEPLOYMENTS_JSON}")
+
+          if [[ -z "${BASE}" ]]; then
+            echo "No prior successful deployment found for env=${TARGET_ENV}; selecting all lambdas from current branch."
+            CHANGED_LINES="$(find lambdas -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort || true)"
+          else
+            echo "Using base from latest successful deployment for env=${TARGET_ENV}: ${BASE}"
+            CHANGED_LINES="$(python3 scripts/changed_lambdas.py --base-ref "${BASE}" || true)"
+          fi
 
           if [[ -z "${CHANGED_LINES}" ]]; then
             echo "No lambda changes detected."
@@ -73,6 +99,9 @@ jobs:
     needs: detect-changes
     if: ${{ needs.detect-changes.outputs.matrix != '[]' }}
     environment: ${{ needs.detect-changes.outputs.env }}
+    env:
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET_NAME }}
+      ARTIFACT_ROLE_ARN: ${{ vars.ARTIFACT_ROLE }}
 
     strategy:
       fail-fast: false
@@ -91,21 +120,44 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyyaml
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-
       - name: Package lambda
         run: |
           chmod +x scripts/package_lambda.sh
           ./scripts/package_lambda.sh "${{ matrix.lambda }}"
 
+      - name: Configure AWS credentials for artifact upload (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ARTIFACT_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Upload lambda artifact to durable storage
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ARTIFACT_BUCKET:-}" || -z "${ARTIFACT_ROLE_ARN:-}" ]]; then
+            echo "ARTIFACT_BUCKET_NAME and ARTIFACT_ROLE org vars are required." >&2
+            exit 1
+          fi
+
+          ARTIFACT_KEY="${{ github.event.repository.name }}/${{ needs.detect-changes.outputs.env }}/${{ matrix.lambda }}/Build${{ github.run_number }}/${{ matrix.lambda }}.zip"
+          LOCAL_ZIP=".artifacts/${{ matrix.lambda }}.zip"
+
+          aws s3 cp "${LOCAL_ZIP}" "s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
+
+          echo "ARTIFACT_KEY=${ARTIFACT_KEY}" >> "$GITHUB_ENV"
+          echo "Uploaded durable artifact: s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
+
+      - name: Configure AWS credentials for lambda deploy (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
       - name: Deploy lambda code
         run: |
           chmod +x scripts/deploy_lambda.sh
-          ./scripts/deploy_lambda.sh "${{ needs.detect-changes.outputs.env }}" "${{ matrix.lambda }}"
+          ./scripts/deploy_lambda.sh "${{ needs.detect-changes.outputs.env }}" "${{ matrix.lambda }}" "${ARTIFACT_BUCKET}" "${ARTIFACT_KEY}"
 
   apigw-redeploy:
     runs-on: ubuntu-latest
