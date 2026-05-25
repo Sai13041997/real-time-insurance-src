@@ -3,16 +3,12 @@ set -euo pipefail
 
 ENV_NAME="${1:?env required (e.g. dev/prod)}"
 LAMBDA="${2:?lambda folder name required}"
+ARTIFACT_BUCKET="${3:?artifact bucket required}"
+ARTIFACT_KEY="${4:?artifact key required}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_LAMBDAS="${ROOT}/config/lambdas.yml"
 CONFIG_ENVS="${ROOT}/config/environments.yml"
-
-ZIP_PATH="${ROOT}/.artifacts/${LAMBDA}.zip"
-if [[ ! -f "${ZIP_PATH}" ]]; then
-  echo "Artifact not found. Run package first: ${ZIP_PATH}" >&2
-  exit 1
-fi
 
 read -r FUNCTION_NAME AWS_REGION < <(
   python3 -c '
@@ -39,9 +35,11 @@ print(fn, region)
 
 echo "Deploying ${LAMBDA} -> ${FUNCTION_NAME} (env=${ENV_NAME}, region=${AWS_REGION})"
 
+echo "Using durable artifact: s3://${ARTIFACT_BUCKET}/${ARTIFACT_KEY}"
 aws lambda update-function-code \
   --region "${AWS_REGION}" \
   --function-name "${FUNCTION_NAME}" \
-  --zip-file "fileb://${ZIP_PATH}"
+  --s3-bucket "${ARTIFACT_BUCKET}" \
+  --s3-key "${ARTIFACT_KEY}"
 
 echo "Deployed."
